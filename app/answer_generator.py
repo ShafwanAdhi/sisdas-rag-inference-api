@@ -26,6 +26,7 @@ INTENT_TEMPLATE_MAP = {
 }
 
 
+
 def choose_top_k_for_answer(query_intent: str) -> int:
     if query_intent in {"date_schedule", "payment_schedule"}:
         return 2
