@@ -4,7 +4,7 @@ import random
 import requests
 from google import genai
 
-GEMINI_API_KEY = "rahasia:D"
+GEMINI_API_KEY = "rahasia bg"
 
 if not GEMINI_API_KEY:
     raise RuntimeError("GEMINI_API_KEY belum diset di environment variable.")
