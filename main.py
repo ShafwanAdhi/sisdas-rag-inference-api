@@ -10,7 +10,7 @@ from pydantic import BaseModel, Field
 
 from app.router import route_query_domain
 from app.retrieval import get_vectorstore, retrieve
-from app.answer_generator import generate_answer_from_context
+from app.answer_generator import choose_top_k_for_answer, generate_answer_from_context
 
 from app.domains import academic_administration
 from app.domains import thesis_final_project_and_graduation
@@ -61,14 +61,21 @@ class ContextResponse(BaseModel):
     keyword_bonus: Optional[float] = None
     penalty: Optional[float] = None
     final_score: Optional[float] = None
+    retrieval_rank: Optional[int] = None
+    rerank_rank: Optional[int] = None
+    rank_delta: Optional[int] = None
+    matched_rerank_keywords: List[str] = Field(default_factory=list)
+    contains_rerank_keyword: bool = False
 
 
 class ChatResponse(BaseModel):
     user_query: str
     answer: str
     route: Dict[str, Any]
-    analyses: Dict[str, Any] = {}
-    contexts: List[ContextResponse] = []
+    analyses: Dict[str, Any] = Field(default_factory=dict)
+    contexts: List[ContextResponse] = Field(default_factory=list)
+    reranking_keyword: Dict[str, Any] = Field(default_factory=dict)
+    query_intent_adaptive_top_k: Dict[str, Any] = Field(default_factory=dict)
 
 
 def serialize_context(item: Dict[str, Any]) -> Dict[str, Any]:
@@ -85,6 +92,11 @@ def serialize_context(item: Dict[str, Any]) -> Dict[str, Any]:
         "keyword_bonus": item.get("keyword_bonus"),
         "penalty": item.get("penalty"),
         "final_score": item.get("final_score"),
+        "retrieval_rank": item.get("retrieval_rank"),
+        "rerank_rank": item.get("rerank_rank"),
+        "rank_delta": item.get("rank_delta"),
+        "matched_rerank_keywords": item.get("matched_rerank_keywords", []),
+        "contains_rerank_keyword": item.get("contains_rerank_keyword", False),
     }
 
 
@@ -95,6 +107,133 @@ def make_sse_event(event: str, data: Dict[str, Any]) -> str:
     """
     json_data = json.dumps(data, ensure_ascii=False, default=str)
     return f"event: {event}\ndata: {json_data}\n\n"
+
+
+def get_matched_keywords(text: str, rerank_keywords: List[str]) -> List[str]:
+    """
+    Menandai keyword hasil analyzer yang benar-benar muncul pada chunk.
+    Ini dipakai untuk kebutuhan whitebox reranking keyword.
+    """
+    text_lower = text.lower()
+    matched_keywords = []
+
+    for keyword in rerank_keywords:
+        keyword_text = str(keyword).strip()
+        if keyword_text and keyword_text.lower() in text_lower:
+            matched_keywords.append(keyword_text)
+
+    return matched_keywords
+
+
+def summarize_context_for_whitebox(item: Dict[str, Any]) -> Dict[str, Any]:
+    doc = item.get("doc")
+    metadata = getattr(doc, "metadata", {}) or {}
+
+    return {
+        "file_name": metadata.get("file_name"),
+        "page": metadata.get("page"),
+        "chunk_index": metadata.get("chunk_index"),
+        "domain": metadata.get("domain"),
+        "topic": metadata.get("topic"),
+        "retrieval_rank": item.get("retrieval_rank"),
+        "rerank_rank": item.get("rerank_rank"),
+        "rank_delta": item.get("rank_delta"),
+        "keyword_bonus": item.get("keyword_bonus"),
+        "penalty": item.get("penalty"),
+        "final_score": item.get("final_score"),
+        "matched_rerank_keywords": item.get("matched_rerank_keywords", []),
+    }
+
+
+def annotate_rerank_results(
+    *,
+    retrieved_results: List[Any],
+    reranked_results: List[Dict[str, Any]],
+    rerank_keywords: List[str],
+) -> List[Dict[str, Any]]:
+    """
+    Menambahkan rank sebelum dan sesudah reranking supaya frontend bisa
+    mengecek apakah chunk yang memuat keyword penting naik peringkat.
+    """
+    retrieval_rank_by_doc = {
+        id(doc): rank
+        for rank, (doc, _distance) in enumerate(retrieved_results, start=1)
+    }
+
+    for rerank_rank, item in enumerate(reranked_results, start=1):
+        doc = item.get("doc")
+        retrieval_rank = retrieval_rank_by_doc.get(id(doc))
+        matched_keywords = get_matched_keywords(
+            getattr(doc, "page_content", ""),
+            rerank_keywords,
+        )
+
+        item["retrieval_rank"] = retrieval_rank
+        item["rerank_rank"] = rerank_rank
+        item["rank_delta"] = (
+            retrieval_rank - rerank_rank
+            if retrieval_rank is not None
+            else None
+        )
+        item["matched_rerank_keywords"] = matched_keywords
+        item["contains_rerank_keyword"] = bool(matched_keywords)
+
+    return reranked_results
+
+
+def build_keyword_reranking_report(
+    *,
+    domain: str,
+    analysis: Dict[str, Any],
+    retrieved_count: int,
+    reranked_results: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    keyword_contexts = [
+        item
+        for item in reranked_results
+        if item.get("contains_rerank_keyword")
+    ]
+    promoted_contexts = [
+        item
+        for item in keyword_contexts
+        if (item.get("rank_delta") or 0) > 0
+    ]
+
+    return {
+        "domain": domain,
+        "rerank_keywords": analysis.get("rerank_keywords", []),
+        "retrieved_count": retrieved_count,
+        "reranked_count": len(reranked_results),
+        "chunks_with_keyword_count": len(keyword_contexts),
+        "promoted_keyword_chunk_count": len(promoted_contexts),
+        "chunks_with_keyword_promoted": bool(promoted_contexts),
+        "top_keyword_chunks": [
+            summarize_context_for_whitebox(item)
+            for item in keyword_contexts[:5]
+        ],
+    }
+
+
+def build_query_intent_top_k_report(
+    *,
+    best_domain: Optional[str],
+    analyses: Dict[str, Any],
+    available_context_count: int,
+) -> Dict[str, Any]:
+    query_intent = analyses.get(best_domain or "", {}).get("analysis", {}).get(
+        "query_intent",
+        "general_info",
+    )
+    adaptive_top_k = choose_top_k_for_answer(query_intent)
+
+    return {
+        "best_domain": best_domain,
+        "query_intent": query_intent,
+        "adaptive_top_k": adaptive_top_k,
+        "context_count_used": min(adaptive_top_k, available_context_count),
+        "available_context_count": available_context_count,
+        "selection_rule": "choose_top_k_for_answer(query_intent)",
+    }
 
 
 def rag_answer(user_query: str) -> Dict[str, Any]:
@@ -112,10 +251,13 @@ def rag_answer(user_query: str) -> Dict[str, Any]:
             "route": route,
             "analyses": {},
             "contexts": [],
+            "reranking_keyword": {},
+            "query_intent_adaptive_top_k": {},
         }
 
     all_contexts = []
     analyses = {}
+    reranking_keyword = {"domains": {}}
 
     for domain in domains:
         domain_module = DOMAIN_MODULES.get(domain)
@@ -139,11 +281,22 @@ def rag_answer(user_query: str) -> Dict[str, Any]:
             rerank_keywords=analysis.get("rerank_keywords", []),
             query=user_query,
         )
+        reranked = annotate_rerank_results(
+            retrieved_results=results,
+            reranked_results=reranked,
+            rerank_keywords=analysis.get("rerank_keywords", []),
+        )
 
         analyses[domain] = {
             "analysis": analysis,
             "metadata_filter": metadata_filter,
         }
+        reranking_keyword["domains"][domain] = build_keyword_reranking_report(
+            domain=domain,
+            analysis=analysis,
+            retrieved_count=len(results),
+            reranked_results=reranked,
+        )
         all_contexts.extend(reranked[:5])
 
     if not all_contexts:
@@ -152,6 +305,8 @@ def rag_answer(user_query: str) -> Dict[str, Any]:
             "route": route,
             "analyses": analyses,
             "contexts": [],
+            "reranking_keyword": reranking_keyword,
+            "query_intent_adaptive_top_k": {},
         }
 
     all_contexts = sorted(
@@ -164,6 +319,25 @@ def rag_answer(user_query: str) -> Dict[str, Any]:
         "query_intent",
         "general_info",
     )
+    query_intent_adaptive_top_k = build_query_intent_top_k_report(
+        best_domain=best_domain,
+        analyses=analyses,
+        available_context_count=len(all_contexts),
+    )
+    reranking_keyword["summary"] = {
+        "chunks_with_keyword_promoted": any(
+            report.get("chunks_with_keyword_promoted")
+            for report in reranking_keyword["domains"].values()
+        ),
+        "promoted_keyword_chunk_count": sum(
+            report.get("promoted_keyword_chunk_count", 0)
+            for report in reranking_keyword["domains"].values()
+        ),
+        "chunks_with_keyword_count": sum(
+            report.get("chunks_with_keyword_count", 0)
+            for report in reranking_keyword["domains"].values()
+        ),
+    }
 
     answer = generate_answer_from_context(
         user_query=user_query,
@@ -176,6 +350,8 @@ def rag_answer(user_query: str) -> Dict[str, Any]:
         "route": route,
         "analyses": analyses,
         "contexts": [serialize_context(item) for item in all_contexts[:3]],
+        "reranking_keyword": reranking_keyword,
+        "query_intent_adaptive_top_k": query_intent_adaptive_top_k,
     }
 
 
@@ -217,12 +393,15 @@ def rag_answer_stream(user_query: str) -> Generator[str, None, None]:
                     "route": route,
                     "analyses": {},
                     "contexts": [],
+                    "reranking_keyword": {},
+                    "query_intent_adaptive_top_k": {},
                 },
             )
             return
 
         all_contexts = []
         analyses = {}
+        reranking_keyword = {"domains": {}}
         total_domains = len(domains)
 
         for index, domain in enumerate(domains, start=1):
@@ -295,6 +474,17 @@ def rag_answer_stream(user_query: str) -> Generator[str, None, None]:
                 rerank_keywords=analysis.get("rerank_keywords", []),
                 query=user_query,
             )
+            reranked = annotate_rerank_results(
+                retrieved_results=results,
+                reranked_results=reranked,
+                rerank_keywords=analysis.get("rerank_keywords", []),
+            )
+            reranking_keyword["domains"][domain] = build_keyword_reranking_report(
+                domain=domain,
+                analysis=analysis,
+                retrieved_count=len(results),
+                reranked_results=reranked,
+            )
 
             all_contexts.extend(reranked[:5])
 
@@ -306,6 +496,7 @@ def rag_answer_stream(user_query: str) -> Generator[str, None, None]:
                     "progress": base_progress + 35,
                     "domain": domain,
                     "selected_context_count": len(reranked[:5]),
+                    "reranking_keyword": reranking_keyword["domains"][domain],
                 },
             )
 
@@ -318,6 +509,8 @@ def rag_answer_stream(user_query: str) -> Generator[str, None, None]:
                     "route": route,
                     "analyses": analyses,
                     "contexts": [],
+                    "reranking_keyword": reranking_keyword,
+                    "query_intent_adaptive_top_k": {},
                 },
             )
             return
@@ -342,6 +535,25 @@ def rag_answer_stream(user_query: str) -> Generator[str, None, None]:
             "query_intent",
             "general_info",
         )
+        query_intent_adaptive_top_k = build_query_intent_top_k_report(
+            best_domain=best_domain,
+            analyses=analyses,
+            available_context_count=len(all_contexts),
+        )
+        reranking_keyword["summary"] = {
+            "chunks_with_keyword_promoted": any(
+                report.get("chunks_with_keyword_promoted")
+                for report in reranking_keyword["domains"].values()
+            ),
+            "promoted_keyword_chunk_count": sum(
+                report.get("promoted_keyword_chunk_count", 0)
+                for report in reranking_keyword["domains"].values()
+            ),
+            "chunks_with_keyword_count": sum(
+                report.get("chunks_with_keyword_count", 0)
+                for report in reranking_keyword["domains"].values()
+            ),
+        }
 
         yield make_sse_event(
             "status",
@@ -351,6 +563,7 @@ def rag_answer_stream(user_query: str) -> Generator[str, None, None]:
                 "progress": 90,
                 "best_domain": best_domain,
                 "query_intent": query_intent,
+                "adaptive_top_k": query_intent_adaptive_top_k["adaptive_top_k"],
             },
         )
 
@@ -368,6 +581,8 @@ def rag_answer_stream(user_query: str) -> Generator[str, None, None]:
                 "route": route,
                 "analyses": analyses,
                 "contexts": [serialize_context(item) for item in all_contexts[:3]],
+                "reranking_keyword": reranking_keyword,
+                "query_intent_adaptive_top_k": query_intent_adaptive_top_k,
             },
         )
 
@@ -411,6 +626,11 @@ async def chat(request: ChatRequest) -> Dict[str, Any]:
             "route": result.get("route", {}),
             "analyses": result.get("analyses", {}),
             "contexts": result.get("contexts", []),
+            "reranking_keyword": result.get("reranking_keyword", {}),
+            "query_intent_adaptive_top_k": result.get(
+                "query_intent_adaptive_top_k",
+                {},
+            ),
         }
     except Exception as exc:
         logger.exception("Failed to process chat request")
